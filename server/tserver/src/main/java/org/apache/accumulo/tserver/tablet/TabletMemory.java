@@ -109,7 +109,7 @@ class TabletMemory implements Closeable {
       tabletMemoryLock.lock();
       try {
         isFinalizedMinC.set(true);
-        finalizedMinC.notifyAll();
+        finalizedMinC.signalAll();
       } finally {
         tabletMemoryLock.unlock();
       }

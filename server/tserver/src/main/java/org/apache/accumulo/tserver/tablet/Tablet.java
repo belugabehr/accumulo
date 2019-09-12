@@ -1034,7 +1034,7 @@ public class Tablet {
         tabletLock.lock();
         try {
           isUpdatingFlushID.set(false);
-          updatingFlushID.notifyAll();
+          updatingFlushID.signalAll();
         } finally {
           tabletLock.unlock();
         }
@@ -1321,7 +1321,7 @@ public class Tablet {
     if (writesInProgress.decrementAndGet() == 0) {
       tabletLock.lock();
       try {
-        writesComplete.notifyAll();
+        writesComplete.signalAll();
       } finally {
         tabletLock.unlock();
       }
@@ -1403,13 +1403,13 @@ public class Tablet {
       // start
       // should cause running major compactions to stop
       closeState.set(CloseState.CLOSING);
-      closeStateChanged.notifyAll();
+      closeStateChanged.signalAll();
 
       // determines if inserts and queries can still continue while minor
       // compacting
       if (disableWrites) {
         closeState.set(CloseState.CLOSED);
-        closeStateChanged.notifyAll();
+        closeStateChanged.signalAll();
       }
 
       // wait for major compactions to finish, setting closing to
@@ -1468,7 +1468,7 @@ public class Tablet {
       // threads entering the method at the same time
       closeCompleting = true;
       closeState.set(CloseState.CLOSED);
-      closeStateChanged.notifyAll();
+      closeStateChanged.signalAll();
 
       // modify dataSourceDeletions so scans will try to switch data sources and
       // fail because the tablet is closed
@@ -1540,7 +1540,7 @@ public class Tablet {
 
       if (completeClose) {
         closeState.set(CloseState.COMPLETE);
-        closeStateChanged.notifyAll();
+        closeStateChanged.signalAll();
       }
     } finally {
       tabletLock.unlock();
@@ -1971,14 +1971,14 @@ public class Tablet {
       t1 = System.currentTimeMillis();
 
       majorCompactionState.set(CompactionState.WAITING_TO_START);
-      majorCompactionStateChange.notifyAll();
+      majorCompactionStateChange.signalAll();
 
       getTabletMemory().waitForMinC();
 
       t2 = System.currentTimeMillis();
 
       majorCompactionState.set(CompactionState.IN_PROGRESS);
-      majorCompactionStateChange.notifyAll();
+      majorCompactionStateChange.signalAll();
 
       SortedMap<FileRef, DataFileValue> allFiles =
           getDatafileManager().getDatafileSizes();
@@ -2279,7 +2279,7 @@ public class Tablet {
       }
 
       majorCompactionState.set(CompactionState.WAITING_TO_START);
-      majorCompactionStateChange.notifyAll();
+      majorCompactionStateChange.signalAll();
     } finally {
       tabletLock.unlock();
     }
@@ -2318,7 +2318,7 @@ public class Tablet {
       tabletLock.lock();
       try {
         majorCompactionState.set(null);
-        majorCompactionStateChange.notifyAll();
+        majorCompactionStateChange.signalAll();
       } finally {
         tabletLock.unlock();
       }
@@ -2462,12 +2462,12 @@ public class Tablet {
       if (splitPoint == null || splitPoint.row == null) {
         log.info("had to abort split because splitRow was null");
         closeState.set(CloseState.OPEN);
-        closeStateChanged.notifyAll();
+        closeStateChanged.signalAll();
         return null;
       }
 
       closeState.set(CloseState.CLOSING);
-      closeStateChanged.notifyAll();
+      closeStateChanged.signalAll();
 
       completeClose(true, false);
 
@@ -2519,7 +2519,7 @@ public class Tablet {
           String.format("offline split time : %6.2f secs", (t2 - t1) / 1000.0));
 
       closeState.set(CloseState.COMPLETE);
-      closeStateChanged.notifyAll();
+      closeStateChanged.signalAll();
 
       return newTablets;
     } finally {
@@ -2977,7 +2977,7 @@ public class Tablet {
           initiateMajorCompaction(MajorCompactionReason.USER);
         } else {
           majorCompactionState.set(CompactionState.IN_PROGRESS);
-          majorCompactionStateChange.notifyAll();
+          majorCompactionStateChange.signalAll();
           updateMetadata = true;
           lastCompactID = compactionId;
         }
@@ -3000,7 +3000,7 @@ public class Tablet {
         tabletLock.lock();
         try {
           majorCompactionState.set(null);
-          majorCompactionStateChange.notifyAll();
+          majorCompactionStateChange.signalAll();
         } finally {
           tabletLock.unlock();
         }

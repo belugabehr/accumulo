@@ -140,7 +140,7 @@ class DatafileManager {
           if (filesToDeleteAfterScan.remove(path)) {
             filesToDelete.add(path);
           }
-          fileScanReferenceCountsChanged.notifyAll();
+          fileScanReferenceCountsChanged.signalAll();
         } else if (refCount < 0)
           throw new IllegalStateException("Scan ref count for " + path + " is " + refCount);
       }
