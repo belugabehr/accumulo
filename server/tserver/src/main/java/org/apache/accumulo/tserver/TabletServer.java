@@ -2192,9 +2192,7 @@ public class TabletServer extends AbstractServer {
 
             tablet.checkIfMinorCompactionNeededForLogs(closedCopy);
 
-            synchronized (tablet) {
-              tablet.initiateMajorCompaction(MajorCompactionReason.NORMAL);
-            }
+            tablet.initiateMajorCompaction(MajorCompactionReason.NORMAL);
           }
         } catch (Throwable t) {
           log.error("Unexpected exception in {}", Thread.currentThread().getName(), t);

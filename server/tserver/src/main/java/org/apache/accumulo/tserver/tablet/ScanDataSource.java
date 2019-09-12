@@ -147,7 +147,8 @@ class ScanDataSource implements DataSource {
 
     SamplerConfigurationImpl samplerConfig = options.getSamplerConfigurationImpl();
 
-    synchronized (tablet) {
+    tablet.getLock().lock();
+    try {
 
       if (memIters != null)
         throw new IllegalStateException("Tried to create new scan iterator w/o releasing memory");
@@ -177,6 +178,8 @@ class ScanDataSource implements DataSource {
           tablet.getDatafileManager().reserveFilesForScan();
       fileReservationId = reservation.getFirst();
       files = reservation.getSecond();
+    } finally {
+      tablet.getLock().unlock();
     }
 
     Collection<InterruptibleIterator> mapfiles =
@@ -258,10 +261,7 @@ class ScanDataSource implements DataSource {
       fileReservationId = -1;
     }
 
-    synchronized (tablet) {
-      if (tablet.removeScan(this) == 0)
-        tablet.notifyAll();
-    }
+    tablet.removeScan(this);
 
     if (fileManager != null) {
       fileManager.releaseOpenFiles(sawErrors);

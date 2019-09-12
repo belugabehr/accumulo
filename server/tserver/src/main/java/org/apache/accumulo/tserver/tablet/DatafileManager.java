@@ -30,6 +30,10 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.accumulo.core.conf.ConfigurationTypeHelper;
 import org.apache.accumulo.core.conf.Property;
@@ -52,6 +56,8 @@ import org.apache.htrace.TraceScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.base.Preconditions;
+
 class DatafileManager {
   private final Logger log = LoggerFactory.getLogger(DatafileManager.class);
   // access to datafilesizes needs to be synchronized: see CompactionRunner#getNumFiles
@@ -61,7 +67,7 @@ class DatafileManager {
   private Long maxMergingMinorCompactionFileSize;
 
   // ensure we only have one reader/writer of our bulk file notes at at time
-  private final Object bulkFileImportLock = new Object();
+  private final Lock bulkFileImportLock = new ReentrantLock();
 
   DatafileManager(Tablet tablet, SortedMap<FileRef,DataFileValue> datafileSizes) {
     for (Entry<FileRef,DataFileValue> datafiles : datafileSizes.entrySet()) {
@@ -75,7 +81,13 @@ class DatafileManager {
   private final Map<Long,Set<FileRef>> scanFileReservations = new HashMap<>();
   private final MapCounter<FileRef> fileScanReferenceCounts = new MapCounter<>();
   private long nextScanReservationId = 0;
-  private boolean reservationsBlocked = false;
+  private AtomicBoolean reservationsBlocked = new AtomicBoolean(false);
+
+  private final Lock datafileManagerLock = new ReentrantLock();
+  private final Condition reservationsNotBlocked =
+      datafileManagerLock.newCondition();
+  private final Condition fileScanReferenceCountsChanged =
+      datafileManagerLock.newCondition();
 
   private final Set<FileRef> majorCompactingFiles = new HashSet<>();
 
@@ -86,14 +98,10 @@ class DatafileManager {
   }
 
   Pair<Long,Map<FileRef,DataFileValue>> reserveFilesForScan() {
-    synchronized (tablet) {
-
-      while (reservationsBlocked) {
-        try {
-          tablet.wait(50);
-        } catch (InterruptedException e) {
-          log.warn("{}", e.getMessage(), e);
-        }
+    datafileManagerLock.lock();
+    try {
+      while (reservationsBlocked.get()) {
+        reservationsNotBlocked.awaitUninterruptibly();
       }
 
       Set<FileRef> absFilePaths = new HashSet<>(datafileSizes.keySet());
@@ -110,6 +118,8 @@ class DatafileManager {
       }
 
       return new Pair<>(rid, ret);
+    } finally {
+      datafileManagerLock.unlock();
     }
   }
 
@@ -117,25 +127,25 @@ class DatafileManager {
 
     final Set<FileRef> filesToDelete = new HashSet<>();
 
-    synchronized (tablet) {
+    datafileManagerLock.lock();
+    try {
       Set<FileRef> absFilePaths = scanFileReservations.remove(reservationId);
 
       if (absFilePaths == null)
         throw new IllegalArgumentException("Unknown scan reservation id " + reservationId);
 
-      boolean notify = false;
       for (FileRef path : absFilePaths) {
         long refCount = fileScanReferenceCounts.decrement(path, 1);
         if (refCount == 0) {
-          if (filesToDeleteAfterScan.remove(path))
+          if (filesToDeleteAfterScan.remove(path)) {
             filesToDelete.add(path);
-          notify = true;
+          }
+          fileScanReferenceCountsChanged.notifyAll();
         } else if (refCount < 0)
           throw new IllegalStateException("Scan ref count for " + path + " is " + refCount);
       }
-
-      if (notify)
-        tablet.notifyAll();
+    } finally {
+      datafileManagerLock.unlock();
     }
 
     if (filesToDelete.size() > 0) {
@@ -151,13 +161,16 @@ class DatafileManager {
 
     Set<FileRef> filesToDelete = new HashSet<>();
 
-    synchronized (tablet) {
+    datafileManagerLock.lock();
+    try {
       for (FileRef path : scanFiles) {
         if (fileScanReferenceCounts.get(path) == 0)
           filesToDelete.add(path);
         else
           filesToDeleteAfterScan.add(path);
       }
+    } finally {
+      datafileManagerLock.unlock();
     }
 
     if (filesToDelete.size() > 0) {
@@ -169,40 +182,41 @@ class DatafileManager {
 
   private TreeSet<FileRef> waitForScansToFinish(Set<FileRef> pathsToWaitFor, boolean blockNewScans,
       long maxWaitTime) {
-    long startTime = System.currentTimeMillis();
     TreeSet<FileRef> inUse = new TreeSet<>();
 
+    datafileManagerLock.lock();
     try (TraceScope waitForScans = Trace.startSpan("waitForScans")) {
-      synchronized (tablet) {
-        if (blockNewScans) {
-          if (reservationsBlocked)
-            throw new IllegalStateException();
-
-          reservationsBlocked = true;
-        }
-
-        for (FileRef path : pathsToWaitFor) {
-          while (fileScanReferenceCounts.get(path) > 0
-              && System.currentTimeMillis() - startTime < maxWaitTime) {
-            try {
-              tablet.wait(100);
-            } catch (InterruptedException e) {
-              log.warn("{}", e.getMessage(), e);
-            }
-          }
-        }
-
-        for (FileRef path : pathsToWaitFor) {
-          if (fileScanReferenceCounts.get(path) > 0)
-            inUse.add(path);
-        }
-
-        if (blockNewScans) {
-          reservationsBlocked = false;
-          tablet.notifyAll();
-        }
-
+      if (blockNewScans) {
+        Preconditions.checkState(reservationsBlocked.get() == false);
+        reservationsBlocked.set(true);
       }
+
+      long nanos = TimeUnit.MILLISECONDS.toNanos(maxWaitTime);
+      for (FileRef path : pathsToWaitFor) {
+        while (fileScanReferenceCounts.get(path) > 0)
+          if (nanos <= 0L) {
+            break;
+          }
+        try {
+          nanos = fileScanReferenceCountsChanged.awaitNanos(nanos);
+        } catch (InterruptedException e) {
+          // await uninterruptedly
+        }
+      }
+
+      for (FileRef path : pathsToWaitFor) {
+        if (fileScanReferenceCounts.get(path) > 0) {
+          inUse.add(path);
+        }
+      }
+
+      if (blockNewScans) {
+        reservationsBlocked.set(false);
+        reservationsNotBlocked.signalAll();
+      }
+
+    } finally {
+      datafileManagerLock.unlock();
     }
     return inUse;
   }
@@ -241,8 +255,8 @@ class DatafileManager {
       throw new IllegalArgumentException("Can not import files to a metadata tablet");
     }
 
-    synchronized (bulkFileImportLock) {
-
+    bulkFileImportLock.lock();
+    try {
       if (paths.size() > 0) {
         long bulkTime = Long.MIN_VALUE;
         if (setTime) {
@@ -258,9 +272,12 @@ class DatafileManager {
 
         tablet.updatePersistedTime(bulkTime, paths, tid);
       }
+    } finally {
+      bulkFileImportLock.unlock();
     }
 
-    synchronized (tablet) {
+    tablet.getLock().lock();
+    try {
       for (Entry<FileRef,DataFileValue> tpath : paths.entrySet()) {
         if (datafileSizes.containsKey(tpath.getKey())) {
           log.error("Adding file that is already in set {}", tpath.getKey());
@@ -272,6 +289,8 @@ class DatafileManager {
       tablet.getTabletResources().importedMapFiles();
 
       tablet.computeNumEntries();
+    } finally {
+      tablet.getLock().unlock();
     }
 
     for (Entry<FileRef,DataFileValue> entry : paths.entrySet()) {
@@ -449,7 +468,8 @@ class DatafileManager {
       }
     } while (true);
 
-    synchronized (tablet) {
+    tablet.getLock().lock();
+    try {
       t1 = System.currentTimeMillis();
 
       if (datafileSizes.containsKey(newDatafile)) {
@@ -469,6 +489,8 @@ class DatafileManager {
       tablet.flushComplete(flushId);
 
       t2 = System.currentTimeMillis();
+    } finally {
+      tablet.getLock().unlock();
     }
 
     // must do this after list of files in memory is updated above
@@ -523,7 +545,8 @@ class DatafileManager {
     }
 
     TServerInstance lastLocation = null;
-    synchronized (tablet) {
+    tablet.getLock().lock();
+    try {
 
       t1 = System.currentTimeMillis();
 
@@ -555,6 +578,8 @@ class DatafileManager {
 
       tablet.setLastCompactionID(compactionId);
       t2 = System.currentTimeMillis();
+    } finally {
+      tablet.getLock().unlock();
     }
 
     Set<FileRef> filesInUseByScans = waitForScansToFinish(oldDatafiles, false, 10000);
@@ -571,14 +596,14 @@ class DatafileManager {
   }
 
   public SortedMap<FileRef,DataFileValue> getDatafileSizes() {
-    synchronized (tablet) {
+    synchronized (datafileSizes) {
       TreeMap<FileRef,DataFileValue> copy = new TreeMap<>(datafileSizes);
       return Collections.unmodifiableSortedMap(copy);
     }
   }
 
   public Set<FileRef> getFiles() {
-    synchronized (tablet) {
+    synchronized (datafileSizes) {
       HashSet<FileRef> files = new HashSet<>(datafileSizes.keySet());
       return Collections.unmodifiableSet(files);
     }

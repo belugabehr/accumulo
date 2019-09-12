@@ -42,9 +42,8 @@ final class CompactionRunner implements Runnable, Comparable<CompactionRunner> {
     // compaction actually did something.
     if (stats != null && stats.getEntriesRead() > 0) {
       // if there is more work to be done, queue another major compaction
-      synchronized (tablet) {
-        if (reason == MajorCompactionReason.NORMAL && tablet.needsMajorCompaction(reason))
-          tablet.initiateMajorCompaction(reason);
+      if (reason == MajorCompactionReason.NORMAL && tablet.needsMajorCompaction(reason)) {
+        tablet.initiateMajorCompaction(reason);
       }
     }
   }

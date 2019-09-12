@@ -19,17 +19,21 @@ package org.apache.accumulo.tserver.tablet;
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.apache.accumulo.core.data.Mutation;
 import org.apache.accumulo.core.sample.impl.SamplerConfigurationImpl;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.tserver.InMemoryMap;
 import org.apache.accumulo.tserver.InMemoryMap.MemoryIterator;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
+import com.google.common.base.Preconditions;
 
 class TabletMemory implements Closeable {
-  private static final Logger log = LoggerFactory.getLogger(TabletMemory.class);
 
   private final Tablet tablet;
   private InMemoryMap memTable;
@@ -38,6 +42,9 @@ class TabletMemory implements Closeable {
   private long nextSeq = 1L;
   private CommitSession commitSession;
   private ServerContext context;
+  private final Lock tabletMemoryLock = new ReentrantLock();
+  private final Condition finalizedMinC = tabletMemoryLock.newCondition();
+  private final AtomicBoolean isFinalizedMinC = new AtomicBoolean(false);
 
   TabletMemory(Tablet tablet) {
     this.tablet = tablet;
@@ -57,16 +64,9 @@ class TabletMemory implements Closeable {
   }
 
   public CommitSession prepareForMinC() {
-    if (otherMemTable != null) {
-      throw new IllegalStateException();
-    }
-
-    if (deletingMemTable != null) {
-      throw new IllegalStateException();
-    }
-    if (commitSession == null) {
-      throw new IllegalStateException();
-    }
+    Preconditions.checkState(otherMemTable == null);
+    Preconditions.checkState(deletingMemTable == null);
+    Objects.requireNonNull(commitSession);
 
     otherMemTable = memTable;
     memTable =
@@ -83,44 +83,35 @@ class TabletMemory implements Closeable {
   }
 
   public void finishedMinC() {
+    Objects.requireNonNull(otherMemTable);
+    Objects.requireNonNull(commitSession);
+    Preconditions.checkState(deletingMemTable == null);
 
-    if (otherMemTable == null) {
-      throw new IllegalStateException();
-    }
-
-    if (deletingMemTable != null) {
-      throw new IllegalStateException();
-    }
-
-    if (commitSession == null) {
-      throw new IllegalStateException();
-    }
-
-    deletingMemTable = otherMemTable;
-
-    otherMemTable = null;
-    tablet.notifyAll();
+   tabletMemoryLock.lock();
+   try {
+     deletingMemTable = otherMemTable;
+     otherMemTable = null;
+   } finally {
+     tabletMemoryLock.unlock();
+   }
   }
 
   public void finalizeMinC() {
-    if (commitSession == null) {
-      throw new IllegalStateException();
-    }
+    Objects.requireNonNull(commitSession);
+
     try {
       deletingMemTable.delete(15000);
     } finally {
-      synchronized (tablet) {
-        if (otherMemTable != null) {
-          throw new IllegalStateException();
-        }
-
-        if (deletingMemTable == null) {
-          throw new IllegalStateException();
-        }
-
-        deletingMemTable = null;
-
-        tablet.updateMemoryUsageStats(memTable.estimatedSizeInBytes(), 0);
+      Preconditions.checkState(otherMemTable == null);
+      Objects.requireNonNull(deletingMemTable);
+      deletingMemTable = null;
+      tablet.updateMemoryUsageStats(memTable.estimatedSizeInBytes(), 0);
+      tabletMemoryLock.lock();
+      try {
+        isFinalizedMinC.set(true);
+        finalizedMinC.notifyAll();
+      } finally {
+        tabletMemoryLock.unlock();
       }
     }
   }
@@ -130,12 +121,13 @@ class TabletMemory implements Closeable {
   }
 
   public void waitForMinC() {
-    while (otherMemTable != null || deletingMemTable != null) {
-      try {
-        tablet.wait(50);
-      } catch (InterruptedException e) {
-        log.warn("{}", e.getMessage(), e);
+    tabletMemoryLock.lock();
+    try {
+      while (this.isFinalizedMinC.get() == false) {
+        finalizedMinC.awaitUninterruptibly();
       }
+    } finally {
+      tabletMemoryLock.unlock();
     }
   }
 

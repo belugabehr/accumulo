@@ -63,9 +63,7 @@ class MinorCompactionTask implements Runnable {
         FileRef newMapfileLocation = tablet.getNextMapFilename(mergeFile == null ? "F" : "M");
         FileRef tmpFileRef = new FileRef(newMapfileLocation.path() + "_tmp");
         try (TraceScope span = Trace.startSpan("waitForCommits")) {
-          synchronized (tablet) {
-            commitSession.waitForCommitsToFinish();
-          }
+          commitSession.waitForCommitsToFinish();
         }
         try (TraceScope span = Trace.startSpan("start")) {
           while (true) {
